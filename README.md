@@ -268,18 +268,23 @@ uploads with detail (`⬆ name → DriveName — 42% (3.2 MiB/s, ETA 2m58s)`), a
   `--bwlimit`). The choice persists in `app_state.json`.
 - **Re-upload to Drive** — lists anything that never made it onto a Shared
   Drive: items you kept on the Mac (**including a cancelled or timed-out ask**,
-  which defaults to keeping local) and uploads that gave up after repeated
-  failures. Pick one, choose a drive, and it's re-queued — and only marked
-  done once the upload actually lands. This is how you redirect a file you
-  parked locally by mistake; re-adding the same torrent won't re-ask, because
-  the per-download decision is remembered by its id.
-- **Drive storage** — a submenu listing each Shared Drive's fill against the
-  100 GB cap (`Movies — 87.3 GB / 100 GB · 87.3%`, `(grandfathered)` when over).
-  It's refreshed on a background thread (every 15 min, after each upload, and on
-  **Refresh now**), cached to `app_state.json` so it shows last-known numbers
-  instantly on launch, and never blocks the menu. The per-download drive picker
-  is annotated the same way (`Movies — 87% full`) so you can steer toward a
-  roomy drive. When an upload overflows, the notification and **Recent** entry
+  which defaults to keeping local) and uploads that failed. Pick one, choose a
+  drive, and it's re-queued — and only marked done once the upload actually
+  lands. If an upload **fails because the target drive is out of space**, the
+  app prompts immediately to re-pick a *different* drive (the full one excluded,
+  fill-% shown) — no waiting out retries against a drive that can't succeed.
+  Re-adding the same download won't re-ask, because the per-download decision is
+  remembered by its id.
+- **Drive storage** — a monospaced, aligned table of each Shared Drive's
+  **content · trash · total · free** (free = headroom against the 100 GB cap,
+  `over` for grandfathered drives), listing only non-empty drives. Trashed files
+  count against the cap, so trash is surfaced here to show where to reclaim
+  space. A **Sort** submenu orders by name / content / trash / total / free,
+  ascending or descending (the choice persists in `app_state.json`). Refreshed
+  on a background thread (every 5 min, after each upload, and on **Refresh
+  now**), cached so last-known numbers show instantly on launch, never blocking
+  the menu. The per-download drive picker is annotated with fill-% so you can
+  steer toward a roomy drive; on overflow the notification and **Recent** entry
   read `Movies → Movies overflow (overflow)`.
 - **Open log** opens `app.log`.
 
@@ -319,6 +324,27 @@ wiped on reinstall. Run from source, nothing changes.
 ```
 
 `-P` shows live progress; the final destination is printed on success.
+
+## storage-monitor (live terminal dashboard)
+
+`storage_monitor.py` renders per-drive usage as a live terminal table, driven by
+a single `todrive du` call (no per-drive scans):
+
+```sh
+# fast content-only live view (refreshes every 60s)
+./storage_monitor.py
+
+# content · trash · total · per-drive free, sorted by trash (biggest first)
+./storage_monitor.py --trash
+
+# single snapshot and exit
+./storage_monitor.py --once
+```
+
+Sizes are content on the drive, not true free space — Google doesn't report
+this account's quota (`rclone about` returns empty), so **FREE** is per-drive
+headroom against the 100 GB cap (`over` past it). `--trash` also prints how much
+is reclaimable by emptying Shared Drive trash.
 
 ## Watcher vs. named drives
 
