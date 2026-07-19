@@ -158,6 +158,22 @@ class TestTorrentPath(unittest.TestCase):
                         {"path": "/dl/NotThere/b"}]}
         self.assertEqual(app.resolve_local_path(dl), "/dl/NotThere")
 
+    def test_sanitized_dir_name_prefers_on_disk_files(self):
+        # Regression: a torrent whose name contains a path-illegal char (':')
+        # lands on disk under a sanitized name ('_'). The unsanitized
+        # <dir>/<name> never exists, so resolve_local_path must trust the
+        # files[] common parent -- returning the non-existent name made
+        # tree_size read 0 and payload_ready block the upload forever.
+        tmp = tempfile.mkdtemp()
+        on_disk = os.path.join(tmp, "Ace Ventura_ Pet Detective (1994) [1080p]")
+        os.makedirs(on_disk)
+        dl = {"gid": "g4", "dir": tmp,
+              "bittorrent": {"info": {
+                  "name": "Ace Ventura: Pet Detective (1994) [1080p]"}},
+              "files": [{"path": os.path.join(on_disk, "movie.mp4")},
+                        {"path": os.path.join(on_disk, "poster.jpg")}]}
+        self.assertEqual(app.resolve_local_path(dl), on_disk)
+
 
 class TestPollSequence(unittest.TestCase):
     def setUp(self):

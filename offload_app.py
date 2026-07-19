@@ -652,8 +652,19 @@ def resolve_local_path(dl):
         return paths[0]
     if paths:
         common = os.path.commonpath([os.path.abspath(p) for p in paths])
-        # If the torrent name is known, prefer <dir>/<name> even if not yet
-        # verified on disk; else fall back to the common parent.
+        # <dir>/<name> was already tried above and only returned when it
+        # exists on disk; reaching here means it does NOT. The engine's
+        # files[] carry the ACTUAL on-disk names, which can differ from the
+        # torrent name when the filesystem sanitizes an illegal character
+        # (Transmission writes "Ace Ventura: Pet Detective" as
+        # "Ace Ventura_ Pet Detective" -- ':' is illegal in a macOS path).
+        # Returning the non-existent <dir>/<name> here made tree_size() read 0
+        # and payload_ready's size check ("size 0 < expected") block a
+        # multi-file torrent's upload forever. Trust the file paths: their
+        # common parent is where the data really landed. Fall back to
+        # <dir>/<name> only when files[] give no usable common parent.
+        if common and os.path.exists(common):
+            return common
         if d and name:
             return os.path.join(d, name)
         return common
