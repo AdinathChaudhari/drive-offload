@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""yt-show: turn a YouTube playlist into a Drivecast TV show.
+
+Sibling CLI to stream-dl/todrive: downloads each new playlist video (via
+yt-dlp) and uploads it as `<Show> SxxEyy - <Title>.ext` under
+`<Show> Season N/` on a named Shared Drive, reusing renamer.py's canonical
+naming and todrive's connection-string upload leg rather than duplicating
+either.
+
+Pipelined: while video N+1 downloads, video N uploads (a bounded queue gives
+backpressure so at most --batch videos sit on local disk at once). Per-show
+incremental state (what's already uploaded, season/episode cursor) lives in
+yt_shows.json next to rename_cache.json; episode numbering is per-video-id
+and append-only.
+
+Stdlib only at import time; yt_dlp is imported lazily inside probe_playlist/
+download_one so `yt-show --help` and the unit tests work without it installed.
+
+NOTE: this bypasses todrive's 100 GB overflow routing (we rclone moveto each
+finished file straight into its season folder, since a lone file uploaded via
+`todrive up` would land at the drive ROOT, not inside `<Show> Season N/`). A
+single very large show could exceed one Shared Drive's cap -- an accepted
+limitation of this pipelined path; pick another (or a fresh) drive if needed.
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+import renamer
+
+TODRIVE = os.path.join(SCRIPT_DIR, "todrive")
+RCLONE = shutil.which("rclone") or "rclone"
+STATE_PATH = os.path.join(renamer._default_support_dir(), "yt_shows.json")
+
+
+# ===========================================================================
+# State (yt_shows.json)
+# ===========================================================================
+
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("version", 1)
+            data.setdefault("shows", {})
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "shows": {}}
+
+
+def save_state(state):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+# ===========================================================================
+# Probe (lazy yt_dlp)
+# ===========================================================================
+
+def probe_playlist(url):
+    try:
+        import yt_dlp
+    except ImportError:
+        sys.exit("yt-show needs yt-dlp:  pip install yt-dlp  (or use " +
+                 sys.executable + ")")
+    opts = {"extract_flat": "in_playlist", "quiet": True, "no_warnings": True,
+            "skip_download": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    plid = info.get("id") or ""
+    ptitle = info.get("title") or "playlist"
+    items = []   # ordered [(video_id, video_title)]
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        vid = e.get("id")
+        vtitle = e.get("title") or ""
+        if not vid or vtitle in ("[Private video]", "[Deleted video]",
+                                 "[Unavailable video]"):
+            continue
+        items.append((vid, vtitle))
+    return plid, ptitle, items
+
+
+# ===========================================================================
+# Assignment (PURE, module-level, unit-tested elsewhere) -- DO NOT change its
+# semantics.
+# ===========================================================================
+
+def assign_new_episodes(show_rec, plid, new_items, mode):
+    """new_items = ordered [video_id] NOT yet in show_rec['episodes'].
+    mode in {'new','same'}. Returns ordered [(video_id, season, episode)] WITHOUT
+    mutating show_rec (planning is pure; commit happens only after a verified upload).
+    Rolls to the next season after episode 100 (drivecast caps at E999)."""
+    episodes = show_rec.get("episodes", {})
+    playlists = show_rec.get("playlists", {})
+    seasons_present = [e["season"] for e in episodes.values()]
+    max_season = max(seasons_present) if seasons_present else 0
+    if plid in playlists:
+        target = playlists[plid]["season"]
+    elif not episodes:
+        target = 1
+    elif mode == "new":
+        target = max_season + 1
+    else:
+        target = max_season if max_season >= 1 else 1
+
+    def next_ep_for(s):
+        used = [e["episode"] for e in episodes.values() if e["season"] == s]
+        return (max(used) + 1) if used else 1
+
+    next_ep = next_ep_for(target)
+    out = []
+    for vid in new_items:
+        # On rollover past E100, advance to the next season that has room,
+        # resuming from its committed cursor so we never reuse a (season,
+        # episode) already held by another playlist (no-dup, requirements A/B).
+        while next_ep > 100:
+            target += 1
+            next_ep = next_ep_for(target)
+        out.append((vid, target, next_ep))
+        next_ep += 1
+    return out
+
+
+# ===========================================================================
+# Drive resolution + interactive picker
+# ===========================================================================
+
+def resolve_connstr(drive):
+    """'todrive resolve --create' prints the rclone connstr (e.g.
+    'gdrive,team_drive=<ID>:')."""
+    r = subprocess.run([sys.executable, TODRIVE, "resolve", "--create", drive],
+                       capture_output=True, text=True)
+    dest = (r.stdout or "").strip()
+    if r.returncode != 0 or not dest:
+        sys.exit("could not resolve/create drive %r: %s" %
+                 (drive, (r.stderr or "").strip()))
+    return dest   # ends with ':'
+
+
+def _human(n):
+    """DECIMAL sizes to match todrive/Drivecast's 100 GB cap accounting."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000.0:
+            return "%.1f %s" % (n, unit)
+        n /= 1000.0
+    return "%.1f PB" % n
+
+
+def parse_drive_usage(data):
+    """Turn a 'todrive du --json' payload into {name: {used,cap,free,pct}}.
+    'used' and 'free' count trash against the cap (trashed files still occupy a
+    Shared Drive), matching storage_monitor.py's FREE/TOTAL columns. Pure."""
+    cap = data.get("cap_bytes") or 0
+    out = {}
+    for d in (data.get("drives") or []):
+        name = d.get("name") or ""
+        if not name:
+            continue
+        used = (d.get("bytes", 0) or 0) + (d.get("trash_bytes", 0) or 0)
+        out[name] = {
+            "used": used, "cap": cap,
+            "free": (max(0, cap - used) if cap else None),
+            "pct": (round(used / cap * 100, 1) if cap else None),
+        }
+    return out
+
+
+def fetch_drive_usage():
+    """Live per-drive usage via 'todrive du --json' (read-only files.list GETs,
+    fresher than the GUI's 5-min cache). Best-effort: returns {} on any error so
+    it never blocks the actual download/upload."""
+    try:
+        r = subprocess.run([sys.executable, TODRIVE, "du", "--json"],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not r.stdout.strip():
+            return {}
+        return parse_drive_usage(json.loads(r.stdout))
+    except Exception:
+        return {}
+
+
+def drive_storage_line(drive, usage=None):
+    """One-line live headroom for a drive, or None if usage is unknown (e.g. a
+    brand-new drive not yet created)."""
+    u = (usage if usage is not None else fetch_drive_usage()).get(drive)
+    if not u or u["free"] is None:
+        return None
+    return "drive %r: %s used · %s free of %s (%.0f%% full)" % (
+        drive, _human(u["used"]), _human(u["free"]), _human(u["cap"]), u["pct"])
+
+
+def pick_drive():
+    """--pick: list Shared Drives, let the user choose one or type a NEW name
+    to create."""
+    names = []
+    r = subprocess.run([sys.executable, TODRIVE, "list", "--json"],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            names = [d.get("name") for d in json.loads(r.stdout) if d.get("name")]
+        except ValueError:
+            names = []
+    if not names:   # fallback: parse the plain table (skip NAME header + summary)
+        r2 = subprocess.run([sys.executable, TODRIVE, "list"],
+                            capture_output=True, text=True)
+        for ln in (r2.stdout or "").splitlines():
+            s = ln.strip()
+            if s and not s.startswith("NAME") and "shared drive" not in s:
+                names.append(s.split("  ")[0].strip())
+    usage = fetch_drive_usage()   # live headroom per drive (best-effort)
+    print("Shared drives:")
+    for i, n in enumerate(names, 1):
+        u = usage.get(n)
+        if u and u["free"] is not None:
+            print("  %d) %-24s %s free · %.0f%% full" %
+                 (i, n, _human(u["free"]), u["pct"]))
+        else:
+            print("  %d) %s" % (i, n))
+    print("  (enter a number, or type a NEW drive name to create it)")
+    choice = input("drive> ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        return names[int(choice) - 1]
+    if not choice:
+        sys.exit("no drive selected")
+    return choice
+
+
+# ===========================================================================
+# Download (lazy yt_dlp; aria2c multi-connection per video = Motrix-style)
+# ===========================================================================
+
+def download_one(vid, out_stem_path, height, connections):
+    """Download one video to out_stem_path + real ext. Returns the produced
+    file path, or None on failure. connections>1 -> aria2c external
+    downloader (-x/-s N) if aria2c is on PATH, else native concurrent
+    fragments. VIDEOS are downloaded sequentially by the caller; the
+    parallelism is WITHIN each video (YouTube throttles per connection, so
+    multi-connection is the speed win)."""
+    import yt_dlp
+    outtmpl = out_stem_path.replace("%", "%%") + ".%(ext)s"
+    if height:
+        fmt = ("bestvideo[height<=%d]+bestaudio/best[height<=%d]/best" %
+               (height, height))
+    else:
+        fmt = "bestvideo+bestaudio/best"
+    opts = {"format": fmt, "outtmpl": outtmpl, "quiet": True, "no_warnings": True,
+            "noplaylist": True, "merge_output_format": "mp4"}
+    if connections and connections > 1 and shutil.which("aria2c"):
+        opts["external_downloader"] = "aria2c"
+        opts["external_downloader_args"] = {
+            "aria2c": ["-x", str(connections), "-s", str(connections), "-k", "1M"]}
+    else:
+        opts["concurrent_fragment_downloads"] = 4
+    url = "https://www.youtube.com/watch?v=" + vid
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        sys.stderr.write("  ! download failed for %s: %s\n" % (vid, exc))
+        for p in glob.glob(glob.escape(out_stem_path) + ".*"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return None
+    hits = [p for p in glob.glob(glob.escape(out_stem_path) + ".*")
+            if not p.endswith((".part", ".ytdl", ".aria2"))]
+    return hits[0] if hits else None
+
+
+# ===========================================================================
+# Upload leg -- per FILE, straight to the drive (mirrors stream-dl's
+# rclone-to-connstr pattern)
+# ===========================================================================
+
+def upload_file(filepath, connstr, folder):
+    """rclone moveto <file> <connstr><folder>/<basename> -- moves ONE finished
+    file into the season folder on Drive and deletes it locally on success.
+    (We cannot 'todrive up' a lone file: it would land at the drive ROOT, not
+    inside '<Show> Season N/'.) Returns rclone's return code."""
+    dest = connstr + folder + "/" + os.path.basename(filepath)
+    cmd = [RCLONE, "moveto", filepath, dest, "--drive-chunk-size", "128M"]
+    return subprocess.run(cmd).returncode
+
+
+# ===========================================================================
+# The pipeline -- producer (download, main thread) + consumer (upload, worker
+# thread). A bounded queue.Queue(maxsize=args.batch) caps how many videos sit
+# on local disk (backpressure: the producer blocks on put() when the consumer
+# lags). Overlap: while the producer downloads item N+1, the consumer uploads
+# item N. STATE is written ONLY by the consumer thread (single writer) so no
+# lock is needed; the producer never mutates show_rec. An episode is
+# committed to state ONLY after rclone rc==0.
+# ===========================================================================
+
+def upload_worker(q, connstr, display, plid, show_rec, state, results, results_lock):
+    while True:
+        job = q.get()
+        try:
+            if job is None:
+                return
+            a, filepath = job
+            # Guard the whole job: if this thread died (e.g. rclone missing ->
+            # FileNotFoundError, or save_state -> OSError) the producer would
+            # deadlock forever on the bounded queue. Stay alive, count the
+            # failure, leave the file local for the next run to retry.
+            try:
+                folder = renamer.canonical_folder_name(display, a["season"])
+                print("  ^ upload  S%02dE%02d -> %s" % (a["season"], a["episode"], folder))
+                rc = upload_file(filepath, connstr, folder)
+                if rc == 0:
+                    show_rec["episodes"][a["vid"]] = {
+                        "season": a["season"], "episode": a["episode"], "playlist": plid,
+                        "title": renamer.clean_source_title(a["title"], display),
+                        "uploaded": datetime.date.today().isoformat()}
+                    cur = show_rec["playlists"].get(plid, {}).get("season", 0)
+                    show_rec["playlists"][plid] = {"season": max(cur, a["season"])}
+                    save_state(state)
+                    with results_lock:
+                        results["uploaded"] += 1
+                else:
+                    sys.stderr.write("  ! upload failed S%02dE%02d (rc=%d); left local %s\n"
+                                     % (a["season"], a["episode"], rc, filepath))
+                    with results_lock:
+                        results["failed"] += 1
+            except Exception as exc:
+                sys.stderr.write("  ! upload worker error S%02dE%02d: %s\n"
+                                 % (a["season"], a["episode"], exc))
+                with results_lock:
+                    results["failed"] += 1
+        finally:
+            q.task_done()
+
+
+# ===========================================================================
+# CLI / main
+# ===========================================================================
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="yt-show",
+        description="Turn a YouTube playlist into a Drivecast TV show "
+                    "(download + upload pipelined).")
+    ap.add_argument("url", help="YouTube playlist URL")
+    ap.add_argument("--show", default=None,
+                    help="display show name (default: cleaned playlist title "
+                         "on a brand-new show)")
+    ap.add_argument("--drive", default=None,
+                    help="Shared Drive name (required on a brand-new show "
+                         "unless --pick or an existing routing hit supplies one)")
+    ap.add_argument("--pick", action="store_true",
+                    help="interactively choose/create the drive; overrides --drive")
+    season_grp = ap.add_mutually_exclusive_group()
+    season_grp.add_argument("--new-season", action="store_true",
+                            help="start a new season for a not-yet-known "
+                                 "playlist added to an existing show")
+    season_grp.add_argument("--same-season", action="store_true",
+                            help="append to the current season for a "
+                                 "not-yet-known playlist (default)")
+    ap.add_argument("--height", type=int, default=1080,
+                    help="max video height (0 = best available; default 1080)")
+    ap.add_argument("--connections", type=int, default=16,
+                    help="per-video aria2c connections (<=1 -> native "
+                         "concurrent fragments; default 16)")
+    ap.add_argument("--batch", type=int, default=10,
+                    help="max videos staged on local disk at once (bounded "
+                         "download/upload queue; default 10)")
+    ap.add_argument("--stage", default=os.path.expanduser(
+                        "~/Downloads/yt-show-stage"),
+                    help="local staging directory")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan and exit without downloading/uploading")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    state = load_state()
+    shows = state.setdefault("shows", {})
+
+    plid, ptitle, items = probe_playlist(args.url)
+    if not items:
+        print("no playable videos")
+        return 0
+
+    # Resolve target show: if this playlist already belongs to a show, use it
+    # (regardless of --show, which we just note as a mismatch).
+    slug = None
+    for s_slug, s_rec in shows.items():
+        if plid in (s_rec.get("playlists") or {}):
+            slug = s_slug
+            break
+    if slug is None:
+        display = args.show or (renamer._clean_show(ptitle)[0] or ptitle)
+        slug = renamer._slug(display)
+    else:
+        display = shows[slug]["display"]
+        if args.show and renamer._slug(args.show) != slug:
+            print("note: playlist already belongs to show %r (ignoring --show %r)"
+                 % (display, args.show))
+
+    show_rec = shows.get(slug)
+    if show_rec is None:
+        if args.pick:
+            drive = pick_drive()
+        elif args.drive:
+            drive = args.drive
+        else:
+            try:
+                rr = renamer.route(slug, [], renamer.RenameCache(), [])
+            except Exception:
+                rr = None
+            if rr and rr.drive:
+                drive = rr.drive
+                print("note: routed to drive %r via %s" % (drive, rr.source))
+            else:
+                sys.exit("new show %r: pass --drive <SharedDriveName> or --pick"
+                         % display)
+        show_rec = {"display": display, "drive": drive, "episodes": {},
+                   "playlists": {}}
+        shows[slug] = show_rec
+        # Do NOT persist here: --dry-run must not write state, and a real run
+        # persists this record naturally on the first verified upload (the
+        # consumer's save_state writes the whole state, new show included).
+    else:
+        display = show_rec["display"]
+        drive = (pick_drive() if args.pick else args.drive) or show_rec["drive"]
+
+    mode = "new" if args.new_season else "same"
+
+    # New = not already committed AND not a duplicate id within this playlist
+    # (a repeated id would otherwise upload twice, the second commit clobbering
+    # the first and orphaning a duplicate file on the drive).
+    seen = set()
+    new_items = []
+    for (vid, vt) in items:
+        if vid in show_rec["episodes"] or vid in seen:
+            continue
+        seen.add(vid)
+        new_items.append((vid, vt))
+    already = len(items) - len(new_items)
+    titles = dict(new_items)
+    plan = [{"vid": vid, "season": s, "episode": e, "title": titles[vid]}
+            for (vid, s, e) in assign_new_episodes(
+                show_rec, plid, [vid for vid, _ in new_items], mode)]
+
+    print("show=%r  drive=%r  playlist=%s  already=%d  new=%d"
+         % (display, drive, plid, already, len(plan)))
+
+    # Live drive headroom (from 'todrive du --json', fresher than the GUI's
+    # 5-min cache) so the user knows if the playlist will fit before it runs.
+    usage = fetch_drive_usage()
+    sline = drive_storage_line(drive, usage)
+    if sline:
+        print(sline)
+        u = usage.get(drive)
+        if u and u["free"] is not None and u["free"] < 5 * 1000 ** 3:  # < 5 GB
+            print("  ! low headroom — a large playlist may not fit. Drivecast "
+                  "merges '<Show> Season N' across drives, so you can rerun "
+                  "with --pick / --drive on another drive to continue.")
+    elif usage:
+        print("drive %r: new or empty (no usage reported yet)" % drive)
+
+    rp = renamer.plan_from_sequence(
+        [(a["vid"], a["season"], a["episode"], a["title"], ".mp4") for a in plan],
+        display)
+    if rp.rejected:
+        sys.exit("naming contract rejected: " + rp.reason)
+
+    if args.dry_run:
+        for a in plan:
+            folder = renamer.canonical_folder_name(display, a["season"])
+            ep = renamer.synth_episode(display, a["season"], a["episode"], a["title"])
+            leaf = renamer.canonical_episode_name(display, ep, ".mp4")
+            print("S%02dE%02d  %s/%s  -> %s" %
+                 (a["season"], a["episode"], folder, leaf, drive))
+        return 0
+
+    if not plan:
+        print("up to date (%d already on drive)" % already)
+        return 0
+
+    # --- pipeline ------------------------------------------------------
+    os.makedirs(args.stage, exist_ok=True)
+    if shutil.which("rclone") is None:
+        sys.exit("yt-show needs rclone on PATH for uploads "
+                 "(brew install rclone)")
+    connstr = resolve_connstr(drive)   # fail fast before downloading
+
+    results = {"uploaded": 0, "failed": 0}
+    results_lock = threading.Lock()
+    q = queue.Queue(maxsize=max(1, args.batch))
+    worker = threading.Thread(
+        target=upload_worker,
+        args=(q, connstr, display, plid, show_rec, state, results, results_lock),
+        daemon=True)
+    worker.start()
+    try:
+        for i, a in enumerate(plan, 1):
+            folder = renamer.canonical_folder_name(display, a["season"])
+            ep = renamer.synth_episode(display, a["season"], a["episode"], a["title"])
+            stem = renamer.canonical_episode_name(display, ep, "")   # bare stem
+            os.makedirs(os.path.join(args.stage, folder), exist_ok=True)
+            out_stem = os.path.join(args.stage, folder, stem)
+            print("[%d/%d] v S%02dE%02d  %s" %
+                 (i, len(plan), a["season"], a["episode"], a["title"]))
+            got = download_one(a["vid"], out_stem, args.height, args.connections)
+            if got:
+                q.put((a, got))     # blocks when full -> bounds disk + overlaps upload
+            else:
+                with results_lock:
+                    results["failed"] += 1
+    except KeyboardInterrupt:
+        print("\ninterrupted — finishing queued uploads...")
+    finally:
+        q.put(None)                 # sentinel
+        worker.join()               # drain: let queued uploads finish + commit
+
+    # tidy empty season dirs left in stage
+    for d in glob.glob(os.path.join(args.stage, "*")):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+    print("uploaded=%d failed=%d" % (results["uploaded"], results["failed"]))
+    print("refresh the %r drive in Drivecast to see the show" % drive)
+    return 1 if results["failed"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

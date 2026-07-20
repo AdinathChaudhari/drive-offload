@@ -325,6 +325,64 @@ wiped on reinstall. Run from source, nothing changes.
 
 `-P` shows live progress; the final destination is printed on success.
 
+## yt-show — YouTube playlist -> Drivecast TV show
+
+`yt-show` downloads a YouTube playlist and lands each video on a Google Shared
+Drive named `<Show> SxxEyy - <Title>.ext` inside `<Show> Season N/` folders —
+so Drivecast sees the whole playlist as **one continuous TV show** with
+ordered episodes, instead of a pile of loose videos.
+
+Requires `yt-dlp` (`pip install yt-dlp`) plus the same rclone/`todrive` setup
+the rest of this repo uses. `aria2c` is recommended — it's what `--connections`
+uses for Motrix-style multi-connection downloads; without it on PATH, yt-show
+falls back to yt-dlp's native concurrent fragments, which works but is slower.
+
+```sh
+# first run: creates the show and downloads every video in the playlist
+./yt-show "<playlist-url>" --show "My Show" --drive "TV"
+
+# re-run: downloads ONLY new videos and merges them into the existing show
+./yt-show "<playlist-url>"
+
+# add another playlist to the same show as the next season
+./yt-show "<another-playlist>" --show "My Show" --drive "TV" --new-season
+
+# add another playlist to the same show, continuing the current season
+./yt-show "<another-playlist>" --show "My Show" --drive "TV" --same-season
+
+# preview the SxxEyy plan without downloading anything
+./yt-show "<playlist-url>" --dry-run
+```
+
+Flags: `--new-season` / `--same-season` control how a second playlist folds
+into an existing show; `--pick` interactively lets you choose (or create) the
+target Shared Drive instead of passing `--drive`; `--connections N` sets the
+per-video aria2c connection count (default 16); `--height`, `--batch` (also
+caps how many videos are staged on disk at once), and `--stage` tune the
+download; `--dry-run` prints the planned episode numbering and does nothing
+else.
+
+**Performance.** Videos download **sequentially**, but each one is pulled
+multi-connection via aria2c (Motrix-style), which sidesteps YouTube's
+per-connection throttle. Uploads are **pipelined**: video *N* uploads
+(`rclone moveto` straight to the drive) while video *N+1* downloads, with the
+queue bounding local disk usage.
+
+**Live drive capacity.** `--pick` annotates each Shared Drive with its free
+space, and every run prints the target drive's headroom against the 100 GB cap
+(a live `todrive du --json` query — fresher than the menu-bar app's 5-min
+cache), warning when space is low. Because Drivecast merges `<Show> Season N`
+folders across drives, if one drive fills you can rerun with `--pick` /
+`--drive` on another and the show stays a single tile.
+
+**Episode identity is per-video-ID and append-only.** A video's season/episode
+is assigned once and never renumbered — there are no server-side Drive
+renames. Deleted videos keep their slot, and reordering the playlist does not
+change existing episode numbers. Seasons auto-roll after 100 episodes.
+
+State is tracked per show in `yt_shows.json` (in the drive-offload support
+dir), which is how repeat runs know what's already been downloaded.
+
 ## storage-monitor (live terminal dashboard)
 
 `storage_monitor.py` renders per-drive usage as a live terminal table, driven by

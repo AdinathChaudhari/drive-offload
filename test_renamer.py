@@ -307,5 +307,97 @@ class TestIdentify(unittest.TestCase):
         self.assertEqual(ident.layout_hint, "none")
 
 
+# ---------------------------------------------------------------------------
+# Sequence planning — clean_source_title / synth_episode / plan_from_sequence
+# (the yt-show layer: pre-assigned season/episode, no filename markers)
+# ---------------------------------------------------------------------------
+
+class TestSequencePlanning(unittest.TestCase):
+    def test_clean_source_title_strips_show_prefix(self):
+        self.assertEqual(
+            r.clean_source_title("My Show - Real Title", "My Show"),
+            "Real Title")
+
+    def test_clean_source_title_strips_leading_ep_token(self):
+        title = r.clean_source_title("Ep 3: The Reveal", "")
+        self.assertIsNotNone(title)
+        self.assertNotIn("Ep 3", title)
+
+    def test_clean_source_title_excises_embedded_sxxexx(self):
+        title = r.clean_source_title("Recap S02E07 stuff", "")
+        self.assertIsNotNone(title)
+        self.assertNotIn("S02E07", title)
+
+    def test_clean_source_title_drops_hashtags_and_pipes(self):
+        title = r.clean_source_title("Title | Channel #shorts", "")
+        self.assertIsNotNone(title)
+        self.assertNotIn("|", title)
+        self.assertNotIn("#", title)
+
+    def test_clean_source_title_empty_after_clean_is_none(self):
+        self.assertIsNone(r.clean_source_title("#justtags", ""))
+
+    def test_synth_episode_builds_cleaned_episode(self):
+        ep = r.synth_episode("My Show", 1, 2, "My Show - Cool Title")
+        self.assertEqual(ep.season, 1)
+        self.assertEqual(ep.episode, 2)
+        self.assertEqual(ep.title, "Cool Title")
+
+    def test_plan_from_sequence_single_season(self):
+        items = [
+            ("v1", 1, 1, "First Title", ".mp4"),
+            ("v2", 1, 2, "Second Title", ".mp4"),
+            ("v3", 1, 3, "Third Title", ".mp4"),
+        ]
+        p = r.plan_from_sequence(items, "My Show")
+        self.assertFalse(p.rejected, p.reason)
+        self.assertEqual(len(p.ops), 3)
+        for _src, dst in p.ops:
+            self.assertTrue(dst.startswith("My Show Season 1/"), dst)
+            leaf = dst.split("/")[-1]
+            stem = leaf.rsplit(".", 1)[0]
+            self.assertIsNotNone(r._C_SXXEXX_RE.search(stem), stem)
+        _assert_contract(self, p)
+
+    def test_plan_from_sequence_duplicate_destination_rejects(self):
+        items = [
+            ("v1", 1, 1, "Same Title", ".mp4"),
+            ("v2", 1, 1, "Same Title", ".mp4"),
+        ]
+        p = r.plan_from_sequence(items, "My Show")
+        self.assertTrue(p.rejected)
+        self.assertEqual(p.ops, ())
+
+    def test_plan_from_sequence_cross_season(self):
+        items = [
+            ("v1", 1, 1, "Season One Title", ".mp4"),
+            ("v2", 2, 1, "Season Two Title", ".mp4"),
+        ]
+        p = r.plan_from_sequence(items, "My Show")
+        self.assertFalse(p.rejected, p.reason)
+        dsts = _dst_map(p)
+        self.assertTrue(dsts["v1"].startswith("My Show Season 1/"))
+        self.assertTrue(dsts["v2"].startswith("My Show Season 2/"))
+        _assert_contract(self, p)
+
+    def test_clean_source_title_preserves_ordinary_words(self):
+        # Words in the scene-release noise vocabulary (web/complete/extended/
+        # multi) are ordinary in real titles and must NOT truncate the title.
+        self.assertEqual(
+            r.clean_source_title("Caught in the Web of Lies", ""),
+            "Caught in the Web of Lies")
+        self.assertEqual(
+            r.clean_source_title("The Complete Beginner Guide", ""),
+            "The Complete Beginner Guide")
+
+    def test_plan_from_sequence_rejects_range_like_show_name(self):
+        # A show name with digit-dash-digit ("9-1-1") makes "9-1-1 Season 1"
+        # trip drivecast's range regex; the folder gate must reject the plan
+        # rather than upload a folder drivecast would scatter into movies.
+        p = r.plan_from_sequence([("v1", 1, 1, "Pilot", ".mp4")], "9-1-1")
+        self.assertTrue(p.rejected)
+        self.assertEqual(p.ops, ())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

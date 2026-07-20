@@ -726,6 +726,95 @@ def _validate_ops(ops, dir_ops):
 
 
 # ===========================================================================
+# Sequence planning — synthesize the SxxEyy contract for an ORDERED sequence of
+# source videos (e.g. a YouTube playlist) whose filenames carry no episode
+# markers. Season/episode numbers are assigned by the CALLER (yt-show, which
+# holds the per-show cache); this layer only cleans titles, builds canonical
+# names, and gates them through the same R13 contract check every plan gets.
+# ===========================================================================
+
+_YT_LEAD_EP_RE = re.compile(r"^\s*E[Pp]?(?:isode)?[\s._#:\-]*\d+[\s._:\-]*",
+                            re.IGNORECASE)
+
+
+def clean_source_title(title, show=""):
+    """A raw source (YouTube) video title -> an episode title str, or None.
+
+    Strips a leading '<show>' prefix, a leading 'Episode N'/'Ep N' token, any
+    embedded SxxEyy/NxNN marker, #hashtags, pipes, brackets, and emoji/symbol/
+    control chars, then collapses separators. Original casing is preserved
+    (source titles are already human-cased); returns None if nothing usable
+    remains.
+
+    NOTE: unlike _clean_title (used for scene releases), this does NOT truncate
+    at the R4 noise vocabulary — ordinary video titles legitimately contain
+    words like "web", "complete", "extended", "multi" ("Caught in the Web of
+    Lies" must survive intact), so only brackets/separators are cleaned.
+    """
+    t = title or ""
+    if show:
+        t = re.sub(r"^\s*" + re.escape(show) + r"\s*[-:|–—]+\s*", "",
+                   t, flags=re.IGNORECASE)
+    t = _YT_LEAD_EP_RE.sub("", t)
+    hit = _episode_match(t)
+    if hit is not None:
+        _s, _e, start, end = hit
+        t = t[:start] + " " + t[end:]
+    t = re.sub(r"#\w+", " ", t)
+    t = t.replace("|", " ")
+    t = "".join(ch for ch in t
+                if unicodedata.category(ch)[0] != "C"
+                and unicodedata.category(ch) not in ("So", "Sk"))
+    t = _BRACKETS_RE.sub(" ", t)               # drop [..]/(..) groups
+    t = re.sub(r"[._]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" -_.")
+    return t or None
+
+
+def synth_episode(show, season, episode, raw_title):
+    """Build an EpisodeParse for one sequence item (no multi-episode span)."""
+    return EpisodeParse(season=season, episode=episode, show=show,
+                        title=clean_source_title(raw_title, show),
+                        last_episode=None, year=None)
+
+
+def plan_from_sequence(items, show):
+    """Plan canonical names for an ORDERED sequence with PRE-ASSIGNED seasons.
+
+    items: iterable of (video_id, season, episode, raw_title, ext); ext includes
+    the leading dot. video_id is carried through as each op's 'src' token — this
+    plan is a naming + contract-validation GATE / preview, NOT fed to
+    apply_rename (yt-show names files canonically at download time). Returns a
+    RenamePlan; on any contract violation or duplicate destination it is
+    rejected (rejected=True, ops empty).
+    """
+    file_ops = []
+    folders = []
+    for (vid, season, episode, raw_title, ext) in items:
+        ep = synth_episode(show, season, episode, raw_title)
+        folder = canonical_folder_name(show, season)
+        leaf = canonical_episode_name(show, ep, ext)
+        if folder not in folders:
+            folders.append(folder)
+        file_ops.append((vid, folder + "/" + leaf))
+    # _validate_ops only gates folders that appear in dir_ops; the season
+    # folders synthesized here never do, so gate them explicitly against the
+    # same contract (a show name like "9-1-1" trips the range regex — R13).
+    for folder in folders:
+        if contract_split_season_suffix(folder.split("/")[-1]) == (None, None):
+            return RenamePlan(ops=(), deletes=(), rejected=True,
+                              reason="folder %r fails contract "
+                              "split_season_suffix" % folder.split("/")[-1],
+                              is_tv=True, show=show)
+    ok, reason = _validate_ops(file_ops, ())
+    if not ok:
+        return RenamePlan(ops=(), deletes=(), rejected=True, reason=reason,
+                          is_tv=True, show=show)
+    return RenamePlan(ops=tuple(file_ops), deletes=(), rejected=False, reason="",
+                      is_tv=True, show=show, file_ops=tuple(file_ops), dir_ops=())
+
+
+# ===========================================================================
 # Support-dir resolution (mirrors offload_app.support_dir, kept independent so
 # renamer stays importable without offload_app; callers may override paths).
 # ===========================================================================
