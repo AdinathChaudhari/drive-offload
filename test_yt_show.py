@@ -129,6 +129,38 @@ class TestDriveUsage(unittest.TestCase):
         self.assertEqual(yt_show.parse_drive_usage({}), {})
 
 
+class TestShowLock(unittest.TestCase):
+    """The per-show lock is exclusive within/across processes and different
+    shows never block each other; releasing frees it."""
+
+    def _lock_path(self, slug):
+        return os.path.join(yt_show.renamer._default_support_dir(),
+                            ".yt-show-%s.lock" % slug)
+
+    def test_lock_is_exclusive_and_releases(self):
+        slug = "zztestlock%d" % os.getpid()
+        other = "zztestlock%db" % os.getpid()
+        fd1 = yt_show.acquire_show_lock(slug)
+        self.addCleanup(lambda: os.path.exists(self._lock_path(slug))
+                        and os.remove(self._lock_path(slug)))
+        self.addCleanup(lambda: os.path.exists(self._lock_path(other))
+                        and os.remove(self._lock_path(other)))
+        try:
+            self.assertIsNotNone(fd1)
+            # A second acquire of the SAME show is refused while fd1 is held.
+            self.assertIsNone(yt_show.acquire_show_lock(slug))
+            # A DIFFERENT show is not blocked.
+            fdo = yt_show.acquire_show_lock(other)
+            self.assertIsNotNone(fdo)
+            fdo.close()
+        finally:
+            fd1.close()
+        # Once released, the same show can be locked again.
+        fd2 = yt_show.acquire_show_lock(slug)
+        self.assertIsNotNone(fd2)
+        fd2.close()
+
+
 class TestUI(unittest.TestCase):
     """The plain-text UI must be constructible and drivable without rich, a TTY,
     or a real download/upload (all its methods just write terse stderr lines)."""

@@ -51,6 +51,7 @@ plain canonical name.
 import argparse
 import contextlib
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -157,6 +158,29 @@ def save_state(state):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_PATH)
+
+
+def acquire_show_lock(slug):
+    """Take an exclusive, advisory per-show lock so two yt-show runs for the
+    SAME show can't race each other's state writes and staging (concurrent
+    save_state clobbers a commit; both upload the same episode). Returns the
+    open lock file (KEEP IT ALIVE to hold the lock) or None if another live run
+    already holds it. flock is released automatically when this process exits or
+    is killed, so there is no stale lock file to clean up. Different shows use
+    different lock files, so they never block each other."""
+    path = os.path.join(renamer._default_support_dir(), ".yt-show-%s.lock" % slug)
+    fd = open(path, "w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:               # another run holds it (EWOULDBLOCK / EACCES)
+        fd.close()
+        return None
+    try:
+        fd.write("%d\n" % os.getpid())
+        fd.flush()
+    except OSError:
+        pass
+    return fd
 
 
 # ===========================================================================
@@ -1129,6 +1153,17 @@ def main(argv=None):
     if not plan:
         print("up to date (%d already on drive)" % already)
         return 0
+
+    # Per-show exclusive lock: a SECOND yt-show run for the same show would race
+    # this one's per-episode save_state (last writer wins -> a commit vanishes)
+    # and re-upload the same files. Take it only now -- after the dry-run and
+    # up-to-date early exits above, which mutate nothing and so never lock. Held
+    # for the whole pipeline via _show_lock; auto-released when this process
+    # exits or dies (flock), so a crash never leaves a stuck lock.
+    _show_lock = acquire_show_lock(slug)   # noqa: F841 (kept alive to hold lock)
+    if _show_lock is None:
+        sys.exit("another yt-show run for %r is already active -- wait for it to "
+                 "finish (per-show lock)." % display)
 
     # --- pipeline ------------------------------------------------------
     os.makedirs(args.stage, exist_ok=True)
