@@ -333,9 +333,10 @@ so Drivecast sees the whole playlist as **one continuous TV show** with
 ordered episodes, instead of a pile of loose videos.
 
 Requires `yt-dlp` (`pip install yt-dlp`) plus the same rclone/`todrive` setup
-the rest of this repo uses. `aria2c` is recommended — it's what `--connections`
-uses for Motrix-style multi-connection downloads; without it on PATH, yt-show
-falls back to yt-dlp's native concurrent fragments, which works but is slower.
+the rest of this repo uses. `rich` is optional (`pip install rich`) — it powers
+the live dashboard; without it (or on a non-TTY stdout, or with `--plain`)
+yt-show falls back to terse plain-text progress. `aria2c` is only needed for
+`--connections N` (see Performance below).
 
 ```sh
 # first run: creates the show and downloads every video in the playlist
@@ -356,17 +357,29 @@ falls back to yt-dlp's native concurrent fragments, which works but is slower.
 
 Flags: `--new-season` / `--same-season` control how a second playlist folds
 into an existing show; `--pick` interactively lets you choose (or create) the
-target Shared Drive instead of passing `--drive`; `--connections N` sets the
-per-video aria2c connection count (default 16); `--height`, `--batch` (also
-caps how many videos are staged on disk at once), and `--stage` tune the
-download; `--dry-run` prints the planned episode numbering and does nothing
-else.
+target Shared Drive instead of passing `--drive`; `--connections N` switches to
+aria2c multi-connection (default 1 = native); `--max-gap N` caps how many
+episodes may be downloaded-but-not-yet-uploaded before downloading pauses
+(default 3); `--height` and `--stage` tune the download; `--plain` forces
+plain-text progress; `--dry-run` prints the planned episode numbering and does
+nothing else.
 
-**Performance.** Videos download **sequentially**, but each one is pulled
-multi-connection via aria2c (Motrix-style), which sidesteps YouTube's
-per-connection throttle. Uploads are **pipelined**: video *N* uploads
-(`rclone moveto` straight to the drive) while video *N+1* downloads, with the
-queue bounding local disk usage.
+**Performance.** Videos download **sequentially**. The **native** yt-dlp
+downloader is the default — it benchmarked ~3–4× faster than aria2c on
+un-throttled YouTube. `--connections 16` switches to aria2c multi-connection,
+which only helps when a single connection is being throttled to a crawl (a slow
+run prints a hint suggesting it). Uploads are **pipelined**: video *N* uploads
+(`rclone moveto` straight to the drive) while video *N+1* downloads. A gap
+semaphore keeps at most `--max-gap` (default 3) episodes pending upload —
+downloads **pause** when uploads fall behind, so disk stays bounded to ~3 videos.
+
+**Live dashboard.** With `rich` installed and a TTY, the run shows a live
+dashboard: a header (`show → drive`), a one-line drive-capacity readout, an
+overall `episodes N/total` progress bar, and the **concurrent** download and
+upload progress bars — both visible at once, since *N* uploads while *N+1*
+downloads — each with speed and ETA. Without `rich` (or on a non-TTY, or with
+`--plain`) it falls back to terse plain-text progress; `pip install rich` to
+enable the dashboard.
 
 **Live drive capacity.** `--pick` annotates each Shared Drive with its free
 space, and every run prints the target drive's headroom against the 100 GB cap
@@ -382,6 +395,27 @@ change existing episode numbers. Seasons auto-roll after 100 episodes.
 
 State is tracked per show in `yt_shows.json` (in the drive-offload support
 dir), which is how repeat runs know what's already been downloaded.
+
+**Interruption / crash recovery.** Ctrl-C and SIGTERM (e.g. launchd shutdown)
+both drain the same way: the in-flight queue is left to finish uploading and
+committing before the process exits, so at most one episode is ever "in
+flight" when a run stops. Every subsequent run repairs whatever that left
+behind, with no manual cleanup:
+- **Interrupted downloads** resume automatically — yt-dlp continues a
+  partially-downloaded file from where it left off.
+- **A fully-downloaded-but-not-yet-uploaded episode** (killed mid-upload, an
+  upload that failed, or a kill in the split second between a successful
+  upload and its state commit) is detected on the next run by its final
+  filename alone (no `.part`/`.ytdl`/`.aria2` sibling, no leftover pre-merge
+  stream) and uploaded directly — no re-download, and no dependence on the
+  source video still being available on YouTube.
+- **Stale staged files for already-uploaded episodes** (drift from a crash
+  between upload and end-of-run stage cleanup) are deleted automatically at
+  the start of each run. Anything else unrecognized in the stage folder is
+  reported once and left alone — it might belong to a concurrent run or
+  another playlist for the same show.
+- Re-uploading is always safe: `rclone moveto` overwrites the same destination
+  name, so a redundant retry never creates a duplicate on the drive.
 
 ## storage-monitor (live terminal dashboard)
 

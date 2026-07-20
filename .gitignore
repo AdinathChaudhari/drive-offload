@@ -5,6 +5,10 @@ offload.log
 launchd.out.log
 launchd.err.log
 .offload-state.json
+# yt-show per-show state + staging
+yt_shows.json
+yt_shows.json.tmp
+yt-show-stage/
 __pycache__/
 # menu-bar app
 .venv/
