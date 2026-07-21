@@ -801,7 +801,9 @@ def upload_file(filepath, connstr, folder, dest_name, on_progress=None):
     """rclone moveto <file> <connstr><folder>/<dest_name> -- moves ONE finished
     file into the season folder on Drive and deletes it locally on success.
     (We cannot 'todrive up' a lone file: it would land at the drive ROOT, not
-    inside '<Show> Season N/'.) Returns rclone's return code.
+    inside '<Show> Season N/'.) Returns rclone's return code. An empty folder
+    ("") uploads straight to the drive ROOT (yt-video's plain-file path); yt-show
+    itself always passes a real season folder.
 
     dest_name is the CANONICAL leaf the caller computes (never derived from
     filepath's own basename): filepath's basename carries a ' [<video_id>]'
@@ -810,7 +812,7 @@ def upload_file(filepath, connstr, folder, dest_name, on_progress=None):
     With on_progress, run rclone with live stats and stream them to the
     dashboard; total is the local file size, percent/speed come from rclone's
     one-line stats (which it refreshes with a carriage return)."""
-    dest = connstr + folder + "/" + dest_name
+    dest = connstr + (folder + "/" if folder else "") + dest_name
     if on_progress is None:
         cmd = [RCLONE, "moveto", filepath, dest, "--drive-chunk-size", "128M"]
         return subprocess.run(cmd).returncode

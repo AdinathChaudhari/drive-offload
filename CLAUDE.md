@@ -3,6 +3,27 @@
 Uploader/renamer + storage tooling that gets media onto Google Shared Drives
 for the Drivecast ecosystem (see `drivecast/CLAUDE.md` for the sibling repos).
 
+## yt-video
+
+`yt-video` is the SINGLE-video sibling to `yt-show`: download one YouTube video
+and upload it as a plain file (`<Title>.ext`) to a named Shared Drive — at the
+drive ROOT by default, or under `--folder`. No show/season/episode machinery and
+no `yt_shows.json` state; it imports the hyphenated `yt-show` module (via
+`importlib.machinery.SourceFileLoader`) and reuses its download leg, `upload_file`,
+`UI` dashboard, drive picker, and capacity readout as-is. The only `yt-show`
+change it needs: `upload_file` now treats an empty folder (`""`) as the drive
+root (yt-show itself always passes a real season folder, so unchanged there).
+
+`--movie` cleans the messy YouTube title into a `Name (Year)` filename
+(`clean_movie_title`, composing `renamer`'s `_extract_year` / `_NOISE_RE` /
+`_clean_show` / `_sanitize` plus a lead-in/quality-word stripper) and, on a TTY,
+prompts to confirm or retype it (`--name`/`-y`/`--yes` skip the prompt). It
+downloads NO poster/thumbnail: Drivecast's server resolves the image itself — a
+TMDB poster from the parsed name+year (`drivecast/tmdb.py` `enrich`), falling
+back to Google Drive's auto-generated video thumbnail (`drivecast/drive_api.py`
+`fetch_thumbnail`) when TMDB has none. A clean `Name (Year).ext` with no SxxEyy
+markers is all the server needs to file it as a movie. Tests: `test_yt_video.py`.
+
 ## yt-show
 
 `yt-show` is a sibling CLI to `stream-dl` / `todrive`: it builds a Drivecast TV

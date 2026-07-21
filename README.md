@@ -417,6 +417,45 @@ behind, with no manual cleanup:
 - Re-uploading is always safe: `rclone moveto` overwrites the same destination
   name, so a redundant retry never creates a duplicate on the drive.
 
+## yt-video — one YouTube video -> a plain file on a drive
+
+`yt-video` is the single-video sibling to `yt-show`: it downloads **one**
+YouTube video and uploads it as a plain file (`<Title>.ext`) to a named Shared
+Drive — at the drive **root** by default, or under `--folder`. No
+show/season/episode machinery and no `yt_shows.json` state; it reuses yt-show's
+download leg, uploader, live dashboard, drive picker, capacity readout, and
+resume. Same requirements as yt-show (`yt-dlp`, rclone/`todrive`; `rich`
+optional).
+
+```sh
+# download one video to the drive root as "<Title>.mp4"
+./yt-video "<video-url>" --drive "My Drive"
+
+# into a subfolder instead of the root
+./yt-video "<video-url>" --drive "My Drive" --folder "Clips"
+
+# interactively pick/create the drive; preview only
+./yt-video "<video-url>" --pick
+./yt-video "<video-url>" --drive "My Drive" --dry-run
+```
+
+**Movie mode (`--movie`).** Cleans a messy YouTube title into a `Name (Year)`
+filename and, on a TTY, prompts you to confirm or retype it (`--name "..."`
+sets it verbatim, `-y`/`--yes` accepts the guess without prompting):
+
+```sh
+# "Watch Full Movie Interstellar (2014) HD 1080p" -> confirm -> "Interstellar (2014).mp4"
+./yt-video "<video-url>" --drive "Movies" --movie
+```
+
+yt-video downloads **no** poster/thumbnail: Drivecast's server resolves the
+image itself — a TMDB poster matched on the parsed name+year, falling back to
+Google Drive's auto-generated video thumbnail when TMDB has none. A clean
+`Name (Year).ext` with no `SxxEyy` markers is all the server needs to file it as
+a movie and show its poster. Other flags mirror yt-show: `--height`,
+`--connections N`, `--stage`, `--plain`. A complete-but-not-yet-uploaded staged
+file is reused directly on a re-run (no re-download).
+
 ## storage-monitor (live terminal dashboard)
 
 `storage_monitor.py` renders per-drive usage as a live terminal table, driven by
