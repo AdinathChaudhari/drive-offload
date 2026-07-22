@@ -5,7 +5,7 @@ Shared Drives automatically.
 
 > ⚖️ Use only with content you have the right to store.
 
-> 📖 **[Read the case study](CASE-STUDY.md)** — how this was designed and
+> 📖 **[Read the case study](docs/CASE-STUDY.md)** — how this was designed and
 > built through orchestrated AI agents.
 
 There are two modes. **Watcher** (`offloader.py`) monitors a dedicated folder
@@ -303,7 +303,7 @@ Uninstall with `./uninstall-app.sh`. Logs: `app.log` (app), `launchd-app.out.log
 
 The menu-bar app also builds into a self-contained macOS bundle (embedded
 Python + rumps + `todrive`; no repo or venv needed at runtime) with a proper
-icon — see **[BUILD.md](BUILD.md)** for the py2app build, `/Applications`
+icon — see **[BUILD.md](docs/BUILD.md)** for the py2app build, `/Applications`
 install, and LaunchAgent swap. One behavioral difference: the bundled app
 keeps its state (`config.json`, `decisions.json`, `app_state.json`, `app.log`)
 in `~/Library/Application Support/drive-offload/` instead of next to the

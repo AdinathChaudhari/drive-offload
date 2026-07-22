@@ -1027,8 +1027,9 @@ def build_parser():
     season_grp.add_argument("--same-season", action="store_true",
                             help="append to the current season for a "
                                  "not-yet-known playlist (default)")
-    ap.add_argument("--height", type=int, default=1080,
-                    help="max video height (0 = best available; default 1080)")
+    ap.add_argument("--height", type=int, default=0,
+                    help="max video height (0 = best available, the default; "
+                         "e.g. 1080 to cap at 1080p)")
     ap.add_argument("--connections", type=int, default=1,
                     help="per-video download connections. 1 (default) = yt-dlp "
                          "native, which benchmarks fastest when YouTube is not "

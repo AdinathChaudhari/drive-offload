@@ -167,8 +167,9 @@ def build_parser():
                          "unless --name or --yes is given.")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="accept the cleaned movie name without prompting")
-    ap.add_argument("--height", type=int, default=1080,
-                    help="max video height (0 = best available; default 1080)")
+    ap.add_argument("--height", type=int, default=0,
+                    help="max video height (0 = best available, the default; "
+                         "e.g. 1080 to cap at 1080p)")
     ap.add_argument("--connections", type=int, default=1,
                     help="per-video download connections. 1 (default) = yt-dlp "
                          "native (fastest un-throttled); >1 = aria2c multi-"
